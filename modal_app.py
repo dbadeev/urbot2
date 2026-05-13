@@ -365,6 +365,10 @@ def build_perplexity_features():
     OBSERVER_NAME = "microsoft/DialoGPT-small"
     print(f"Loading observer {OBSERVER_NAME}...")
     obs_tok = AT2.from_pretrained(OBSERVER_NAME)
+
+    if obs_tok.pad_token is None:   # для microsoft/DialoGPT-small
+        obs_tok.pad_token = obs_tok.eos_token
+
     obs_model = AM2.from_pretrained(OBSERVER_NAME, dtype=torch.float16).to("cuda")
     obs_model.eval()
 
