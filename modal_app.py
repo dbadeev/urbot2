@@ -124,6 +124,51 @@ def build_basic_features():
                     feats[f"{col}_{s}"] = 0.0
         return feats
 
+    def ngram_diversity(msgs, pidx, n=2):
+        """Доля уникальных n-грамм от общего числа — чем ниже, тем монотоннее."""
+        texts = [m["text"].strip().lower() for m in msgs if m["participant_index"] == pidx]
+        all_ngrams = []
+        for t in texts:
+            tokens = t.split()
+            all_ngrams += [tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)]
+        if not all_ngrams:
+            return 1.0
+        return len(set(all_ngrams)) / len(all_ngrams)
+
+    def vocab_richness(msgs, pidx):
+        """Type-Token Ratio — уникальные слова / все слова."""
+        tokens = []
+        for m in msgs:
+            if m["participant_index"] == pidx:
+                tokens += m["text"].strip().lower().split()
+        if not tokens:
+            return 1.0
+        return len(set(tokens)) / len(tokens)
+
+    def structural_uniformity(msgs, pidx):
+        """Коэффициент вариации длин реплик — низкий у бота."""
+        lengths = [len(m["text"]) for m in msgs if m["participant_index"] == pidx]
+        if len(lengths) < 2:
+            return 0.0
+        mean = np.mean(lengths)
+        if mean < 1e-6:
+            return 0.0
+        return float(np.std(lengths) / mean)  # CV длин — у бота низкий
+
+    def punct_entropy(msgs, pidx):
+        """Энтропия пунктуационных символов — бот использует одни и те же."""
+        from collections import Counter
+        import math
+        puncts = []
+        for m in msgs:
+            if m["participant_index"] == pidx:
+                puncts += [c for c in m["text"] if c in ".,!?;:-—"]
+        if not puncts:
+            return 0.0
+        counts = Counter(puncts)
+        total = sum(counts.values())
+        return float(-sum((v / total) * math.log2(v / total + 1e-9) for v in counts.values()))
+
     NUMERIC_COLS = ["char_len","word_count","cyrillic_ratio",
                     "unique_char_r","upper_ratio","digit_ratio","punct_ratio"]
 
@@ -147,6 +192,11 @@ def build_basic_features():
             feats.update(aggregate_stats(group, NUMERIC_COLS))
             feats["n_utterances"] = len(group)
             feats["self_repeat"] = repetition_self(msgs, pidx)
+            feats["bigram_diversity"] = ngram_diversity(msgs, pidx, n=2)
+            feats["trigram_diversity"] = ngram_diversity(msgs, pidx, n=3)
+            feats["vocab_richness"] = vocab_richness(msgs, pidx)
+            feats["len_cv"] = structural_uniformity(msgs, pidx)
+            feats["punct_entropy"] = punct_entropy(msgs, pidx)
 
             # Эхо-признаки (добавляем для нужного участника)
             echo = echo_features(msgs)
@@ -169,6 +219,17 @@ def build_basic_features():
             #     # (population std), никогда не возвращает NaN даже для одного элемента (будет 0.0).
             #     if len(opp_group) else 0.0
             # )
+
+            if len(opp_group) >= 2:
+                opp_lengths = opp_group["char_len"].values
+                self_lengths = group["char_len"].values
+                feats["len_ratio_median"] = float(np.median(self_lengths) / (np.median(opp_lengths) + 1e-6))
+                feats["len_skew_diff"] = float(safe_skew(self_lengths) - safe_skew(opp_lengths))
+                feats["wordcount_ratio"] = float(group["word_count"].mean() / (opp_group["word_count"].mean() + 1e-6))
+            else:
+                feats["len_ratio_median"] = 1.0
+                feats["len_skew_diff"] = 0.0
+                feats["wordcount_ratio"] = 1.0
             rows.append(feats)
 
         return pd.DataFrame(rows)
@@ -360,8 +421,8 @@ def build_perplexity_features():
     # ─── Binoculars: загружаем observer-модель ───
     from transformers import AutoTokenizer as AT2, AutoModelForCausalLM as AM2
 
-    # OBSERVER_NAME = "ai-forever/rugpt3small_based_on_gpt2"
-    OBSERVER_NAME = "ai-forever/rugpt3large_based_on_gpt2"
+    OBSERVER_NAME = "ai-forever/rugpt3small_based_on_gpt2"
+    # OBSERVER_NAME = "ai-forever/rugpt3large_based_on_gpt2"
     # OBSERVER_NAME = "microsoft/DialoGPT-small"
     print(f"Loading observer {OBSERVER_NAME}...")
     obs_tok = AT2.from_pretrained(OBSERVER_NAME)
