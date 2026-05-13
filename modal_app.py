@@ -361,8 +361,8 @@ def build_perplexity_features():
     from transformers import AutoTokenizer as AT2, AutoModelForCausalLM as AM2
 
     # OBSERVER_NAME = "ai-forever/rugpt3small_based_on_gpt2"
-    # OBSERVER_NAME = "ai-forever/rugpt3large_based_on_gpt2"
-    OBSERVER_NAME = "microsoft/DialoGPT-small"
+    OBSERVER_NAME = "ai-forever/rugpt3large_based_on_gpt2"
+    # OBSERVER_NAME = "microsoft/DialoGPT-small"
     print(f"Loading observer {OBSERVER_NAME}...")
     obs_tok = AT2.from_pretrained(OBSERVER_NAME)
 
