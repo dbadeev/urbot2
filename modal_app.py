@@ -684,6 +684,41 @@ def train_and_predict():
     ytrain["tfidf_lr"] = tfidf_oof
     ytest["tfidf_lr"]  = tfidf_test_pred
 
+    # ─── Отдельные TF-IDF модели на N-й реплике (сильный сигнал по writeup) ───
+    def get_nth_utterance(dialogs, did, pidx, n=0):
+        """Возвращает n-ю реплику участника (0-индексация)."""
+        msgs = sorted(
+            [m for m in dialogs.get(str(did), []) if m["participant_index"] == int(pidx)],
+            key=lambda x: x["message"]
+        )
+        return msgs[n]["text"] if len(msgs) > n else ""
+
+    for utt_idx, col_name in [(0, "tfidf_utt0"), (1, "tfidf_utt1")]:
+        texts_tr = [get_nth_utterance(train_dialogs, r.dialog_id, r.participant_index, utt_idx)
+                    for _, r in ytrain.iterrows()]
+        texts_te = [get_nth_utterance(test_dialogs, r.dialog_id, r.participant_index, utt_idx)
+                    for _, r in ytest.iterrows()]
+
+        # Фильтруем пустые строки: LR не обучится на пустом тексте
+        non_empty_mask = [len(t.strip()) > 0 for t in texts_tr]
+        print(f"utt{utt_idx}: non-empty train={sum(non_empty_mask)}/{len(texts_tr)}")
+
+        tfidf_n = TfidfVectorizer(max_features=5000, analyzer="char_wb",
+                                  ngram_range=(2, 4), min_df=2)
+        X_n_tr = tfidf_n.fit_transform(texts_tr)
+        X_n_te = tfidf_n.transform(texts_te)
+
+        lr_n = LogisticRegression(C=0.3, max_iter=1000, solver="lbfgs")
+        oof_n = cross_val_predict(lr_n, X_n_tr, y_train,
+                                  cv=skf, method="predict_proba")[:, 1]
+        lr_n.fit(X_n_tr, y_train)
+
+        oof_ll = log_loss(y_train, oof_n)
+        print(f"tfidf_utt{utt_idx} OOF logloss: {oof_ll:.4f}")
+
+        ytrain[col_name] = oof_n
+        ytest[col_name] = lr_n.predict_proba(X_n_te)[:, 1]
+
     # Финальная матрица
     meta_train = merge_all(ytrain, train_basic, train_emb, train_lp)
     meta_test  = merge_all(ytest,  test_basic,  test_emb,  test_lp)
@@ -704,6 +739,42 @@ def train_and_predict():
 
     nan_cols = meta_train[FEAT_COLS].isna().sum()
     print("NaN per column:\n", nan_cols[nan_cols > 0])
+
+    # ─── Диагностика: train vs test distribution shift ───
+    print("\n=== Distribution shift: train vs test ===")
+    shift_report = []
+    for col in FEAT_COLS:
+        tr_mean = meta_train[col].mean()
+        te_mean = meta_test[col].mean()
+        tr_std = meta_train[col].std() + 1e-9
+        shift = abs(tr_mean - te_mean) / tr_std  # normalized shift
+        shift_report.append({"feature": col, "train_mean": tr_mean,
+                             "test_mean": te_mean, "shift_sigma": shift})
+
+    shift_df = pd.DataFrame(shift_report).sort_values("shift_sigma", ascending=False)
+    print(shift_df[shift_df["shift_sigma"] > 0.3].to_string())  # только подозрительные
+
+    # ─── Шаг 2а: предварительная модель для отбора признаков ───
+    lgb_pre = lgb.LGBMClassifier(
+        n_estimators=500, learning_rate=0.05,
+        num_leaves=31, random_state=42,
+        colsample_bytree=0.7, subsample=0.8,
+    )
+    lgb_pre.fit(meta_train[FEAT_COLS].fillna(0), y_train)
+
+    importance_df = pd.DataFrame({
+        "feature": FEAT_COLS,
+        "importance": lgb_pre.feature_importances_
+    }).sort_values("importance", ascending=False)
+
+    print("\nFeature importances (top-20):")
+    print(importance_df.head(20).to_string())
+
+    zero_feats = set(importance_df[importance_df["importance"] == 0]["feature"].tolist())
+    print(f"\nRemoving zero-importance: {len(zero_feats)} features: {zero_feats}")
+
+    FEAT_COLS = [c for c in FEAT_COLS if c not in zero_feats]  # ← перезаписываем FEAT_COLS
+    print(f"Features after filtering: {len(FEAT_COLS)}")
 
     train_embs_raw = np.load(f"{MOUNT_PATH}/train_embeddings.npy")  # (3032, 768)  → (3032, 1024)
     test_embs_raw = np.load(f"{MOUNT_PATH}/test_embeddings.npy")  # (758, 768)  → (758, 1024)
