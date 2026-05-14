@@ -626,7 +626,7 @@ def train_and_predict():
     import pandas as pd
 
     from sklearn.metrics.pairwise import cosine_similarity as cos_sim
-    from sklearn.isotonic import IsotonicRegression
+    from sklearn.linear_model import LogisticRegression as PlattLR
 
     # Загрузка данных
     with open(f"{MOUNT_PATH}/train.json") as f:
@@ -921,9 +921,9 @@ def train_and_predict():
                                   cv=skf, method="predict_proba")[:, 1]
     print(f"OOF LogLoss: {log_loss(y_tr, oof_preds):.4f}")
 
-    # ← Isotonic сразу после OOF, пока модель не обучена на всех данных
-    iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(oof_preds, y_tr)
+    # Platt scaling — логистическая регрессия поверх OOF скоров
+    platt = PlattLR(C=1.0, max_iter=1000)
+    platt.fit(oof_preds.reshape(-1, 1), y_tr)
 
     # Финальное обучение с early stopping на hold-out 10%
     X_fit, X_val, y_fit, y_val = train_test_split(
@@ -971,9 +971,13 @@ def train_and_predict():
     # test_probs = lgb_model_final.predict_proba(X_te)[:, 1]
     # test_probs = np.clip(test_probs, 0.001, 0.999)
 
+    # raw_probs = lgb_model_final.predict_proba(X_te)[:, 1]
+    # test_probs = iso.predict(raw_probs)
+    # test_probs = np.clip(test_probs, 0.001, 0.999)  # оставить — isotonic может дать 0.0/1.0
+
     raw_probs = lgb_model_final.predict_proba(X_te)[:, 1]
-    test_probs = iso.predict(raw_probs)
-    test_probs = np.clip(test_probs, 0.001, 0.999)  # оставить — isotonic может дать 0.0/1.0
+    test_probs = platt.predict_proba(raw_probs.reshape(-1, 1))[:, 1]
+    test_probs = np.clip(test_probs, 0.001, 0.999)
 
     # Формирование сабмиссии в нужном формате
     submission = ytest[["ID"]].copy()
