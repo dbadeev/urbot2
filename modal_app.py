@@ -625,6 +625,9 @@ def train_and_predict():
 
     import pandas as pd
 
+    from sklearn.metrics.pairwise import cosine_similarity as cos_sim
+    from sklearn.isotonic import IsotonicRegression
+
     # Загрузка данных
     with open(f"{MOUNT_PATH}/train.json") as f:
         train_dialogs = json.load(f)
@@ -819,8 +822,6 @@ def train_and_predict():
     train_embs_raw = np.load(f"{MOUNT_PATH}/train_embeddings.npy")  # (3032, 768)  → (3032, 1024)
     test_embs_raw = np.load(f"{MOUNT_PATH}/test_embeddings.npy")  # (758, 768)  → (758, 1024)
 
-    from sklearn.metrics.pairwise import cosine_similarity as cos_sim
-
     def add_cross_sim(labels_df, embs_raw):
         """Косинусное сходство эмбеддингов p0 и p1 одного диалога."""
         # Строим словарь (dialog_id, pidx) → индекс строки в embs_raw
@@ -920,6 +921,10 @@ def train_and_predict():
                                   cv=skf, method="predict_proba")[:, 1]
     print(f"OOF LogLoss: {log_loss(y_tr, oof_preds):.4f}")
 
+    # ← Isotonic сразу после OOF, пока модель не обучена на всех данных
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(oof_preds, y_tr)
+
     # Финальное обучение с early stopping на hold-out 10%
     X_fit, X_val, y_fit, y_val = train_test_split(
         X_tr, y_tr, test_size=0.1, stratify=y_tr, random_state=42
@@ -942,18 +947,6 @@ def train_and_predict():
         eval_metric="binary_logloss",
         callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(200)]
     )
-
-    from sklearn.isotonic import IsotonicRegression
-    from sklearn.model_selection import cross_val_predict
-
-    oof_cal = cross_val_predict(
-        lgb_model_final, X_tr, y_tr,
-        cv=skf, method="predict_proba"
-    )[:, 1]
-
-    iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(oof_cal, y_tr)
-
 
     print(f"Best iteration: {lgb_model_final.best_iteration_}")
 
