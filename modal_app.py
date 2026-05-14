@@ -65,6 +65,7 @@ def build_basic_features():
             "unique_char_r":  len(set(text.lower())) / max(len(text), 1),
             "upper_ratio":    sum(1 for c in text if c.isupper()) / max(len(text), 1),
             "has_newline":    int("\n" in text),
+            "ends_with_q": int(text.strip().endswith("?")),
             "digit_ratio":    sum(1 for c in text if c.isdigit()) / max(len(text), 1),
             "punct_ratio":    sum(1 for c in ".,!?;:" if c in text) / max(len(text), 1),
         }
@@ -169,8 +170,9 @@ def build_basic_features():
         total = sum(counts.values())
         return float(-sum((v / total) * math.log2(v / total + 1e-9) for v in counts.values()))
 
-    NUMERIC_COLS = ["char_len","word_count","cyrillic_ratio",
-                    "unique_char_r","upper_ratio","digit_ratio","punct_ratio"]
+    NUMERIC_COLS = ["char_len", "word_count", "cyrillic_ratio",
+                    "unique_char_r", "upper_ratio", "has_newline", "ends_with_q",
+                    "digit_ratio", "punct_ratio"]
 
     def process_split(dialogs, labels_df):
         df = dialogs_to_df(dialogs)
@@ -205,6 +207,7 @@ def build_basic_features():
             # Inter-participant контраст
             opp_group = df[(df["dialog_id"] == did) &
                            (df["participant_index"] == (1 - pidx))]
+            feats["n_utt_diff_opp"] = len(group) - len(opp_group)
             feats["char_len_mean_diff"] = (
                 feats["char_len_mean"] - opp_group["char_len"].mean()
                 if len(opp_group) else 0.0
@@ -728,7 +731,14 @@ def train_and_predict():
     # Coefficient of variation — нормализованная дисперсия
 
     # EXCLUDE = {"dialog_id", "participant_index", "is_bot", "ID"}
-    EXCLUDE = {"dialog_id", "participant_index", "is_bot", "ID", "ood_score"}
+    # EXCLUDE = {"dialog_id", "participant_index", "is_bot", "ID", "ood_score"}
+    EXCLUDE = {
+        "dialog_id", "participant_index", "is_bot", "ID", "ood_score",
+        # cyrillic_ratio — корреляция 0.045, только шум
+        "cyrillic_ratio_mean", "cyrillic_ratio_std", "cyrillic_ratio_median",
+        "cyrillic_ratio_skew", "cyrillic_ratio_min", "cyrillic_ratio_max",
+        "cyrillic_ratio_is_constant",
+    }
     FEAT_COLS = [c for c in meta_train.columns if c not in EXCLUDE]
 
     # Диагностика
