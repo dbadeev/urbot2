@@ -424,16 +424,22 @@ def build_perplexity_features():
     # ─── Binoculars: загружаем observer-модель ───
     from transformers import AutoTokenizer as AT2, AutoModelForCausalLM as AM2
 
-    OBSERVER_NAME = "ai-forever/rugpt3small_based_on_gpt2"
+    # OBSERVER_NAME = "ai-forever/rugpt3small_based_on_gpt2"
     # OBSERVER_NAME = "ai-forever/rugpt3large_based_on_gpt2"
     # OBSERVER_NAME = "microsoft/DialoGPT-small"
+    OBSERVER_NAME = "Qwen/Qwen2.5-3B-Instruct"
     print(f"Loading observer {OBSERVER_NAME}...")
     obs_tok = AT2.from_pretrained(OBSERVER_NAME)
 
     if obs_tok.pad_token is None:   # для microsoft/DialoGPT-small
         obs_tok.pad_token = obs_tok.eos_token
 
-    obs_model = AM2.from_pretrained(OBSERVER_NAME, dtype=torch.float16).to("cuda")
+    # obs_model = AM2.from_pretrained(OBSERVER_NAME, dtype=torch.float16).to("cuda")
+    obs_model = AM2.from_pretrained(
+        OBSERVER_NAME,
+        torch_dtype=torch.float16,
+        device_map="cuda",
+    )
     obs_model.eval()
 
     def process_dialogs(dialogs, labels_df):
@@ -450,10 +456,15 @@ def build_perplexity_features():
                 key=lambda x: x["message"]
             )
             for m in msgs:
-                t = m["text"].strip()[:300] # для qwen и rugpt3large
-                # t = m["text"].strip()       # для llama-3 (контекст 8192 токенов)
-                if len(t) >= 5:
-                    # all_texts.append((did, pidx, t))
+                # t = m["text"].strip()[:300] # для qwen и rugpt3large
+                # # t = m["text"].strip()       # для llama-3 (контекст 8192 токенов)
+                # if len(t) >= 5:
+                #     # all_texts.append((did, pidx, t))
+                #     all_texts.append((str(did), int(pidx), t))
+                t = m["text"].strip()[:400]
+                # Фильтруем по числу токенов, а не символов
+                tok_len = len(tokenizer.encode(t, add_special_tokens=False))
+                if tok_len >= 4:  # минимум 4 реальных токена
                     all_texts.append((str(did), int(pidx), t))
 
         # Шаг 2: батчевый GPU-inference
@@ -465,6 +476,7 @@ def build_perplexity_features():
             batch = all_texts[i:i + BATCH_SIZE]
             texts_batch = [t for _, _, t in batch]
 
+            # ── Перформер ──
             enc = tokenizer(
                 texts_batch,
                 return_tensors="pt",
@@ -474,40 +486,21 @@ def build_perplexity_features():
             ).to("cuda")
 
             with torch.no_grad():
-                logits = model(**enc).logits  # (B, T, V)
+                logits = model(**enc).logits
 
-            shift_logits = logits[:, :-1, :].contiguous()   # (B, T-1, V)
-            shift_labels = enc["input_ids"][:, 1:].contiguous()   # (B, T-1)
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = enc["input_ids"][:, 1:].contiguous()
             pad_id = tokenizer.pad_token_id or 0
 
-            batch_lp = {}
-
-            for j, (did, pidx, _) in enumerate(batch):
-                lb = shift_labels[j]
-                mask = lb != pad_id
-                if mask.sum() == 0:
-                    continue
-                    # cross_entropy в fp16 — без конвертации в fp32
-                loss = F.cross_entropy(
-                    shift_logits[j][mask].float(),  # только нужный срез, не весь тензор
-                    lb[mask]
-                )
-
-                lp = float(-loss.item())
-                logprobs_map.setdefault((str(did), int(pidx)), []).append(lp)
-                batch_lp[j] = lp  # ← сохранять per-j
-                # logprobs_map.setdefault((did, pidx), []).append(float(-loss.item()))
-                # logprobs_map.setdefault((str(did), int(pidx)), []).append(float(-loss.item()))
-
-            del enc, logits, shift_logits, shift_labels
-            torch.cuda.empty_cache()  # ← освобождать после каждого батча
-
-            # ── Observer batch (ruGPT-small) для Binoculars ──
+            # ── Наблюдатель (добавить здесь, ДО единого цикла) ──
             enc_obs = obs_tok(
                 texts_batch,
-                return_tensors="pt", padding=True,
-                truncation=True, max_length=128,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=128,
             ).to("cuda")
+
             with torch.no_grad():
                 logits_obs = obs_model(**enc_obs).logits
 
@@ -515,40 +508,168 @@ def build_perplexity_features():
             shift_labels_obs = enc_obs["input_ids"][:, 1:].contiguous()
             pad_id_obs = obs_tok.pad_token_id or 0
 
+            # ── Единый цикл по репликам ──
             for j, (did, pidx, _) in enumerate(batch):
-                lb = shift_labels_obs[j]
-                mask = lb != pad_id_obs
-                if mask.sum() == 0:
+                lb_p = shift_labels[j]
+                lb_o = shift_labels_obs[j]
+                mask_p = lb_p != pad_id
+                mask_o = lb_o != pad_id_obs
+                common_mask = mask_p & mask_o
+
+                if common_mask.sum() == 0:
                     continue
-                loss_obs = F.cross_entropy(
-                    shift_logits_obs[j][mask].float(), lb[mask]
+
+                n_toks = int(common_mask.sum())
+                smoothing = max(0.0, 0.1 * (1 - n_toks / 8)) if n_toks < 8 else 0.0
+
+                loss_p = F.cross_entropy(
+                    shift_logits[j][common_mask].float(),
+                    lb_p[common_mask],
+                    label_smoothing=smoothing,
                 )
-                lp_list = logprobs_map.get((str(did), int(pidx)), [])
-                # lp_perf = lp_list[-1] if lp_list else None
-                # if lp_perf and lp_perf != 0:
-                #     bino = float(-loss_obs.item()) / abs(lp_perf)
-                # else:
-                #     bino = 1.0
-                lp_perf = batch_lp.get(j)  # ← точное значение для этой реплики
-                if lp_perf and lp_perf != 0:
-                    bino = lp_perf / (-float(loss_obs.item()) - 1e-8)
-                #     bino = float(-loss_obs.item()) / abs
-                #
-                #     lp_obs = -float(loss_obs.item())  # logprob observer (отрицательный)
-                #     # добавлен clipping для стабильности (rugpt3small может давать очень низкий logprob)
-                #     bino = lp_perf / lp_obs  # оба отрицательны → ratio > 0, ~0.5–1.5
-                #     bino = np.clip(bino, 0.0, 3.0)
-                else:
-                    bino = float('nan')
+                loss_o = F.cross_entropy(
+                    shift_logits_obs[j][common_mask].float(),
+                    lb_o[common_mask],
+                    label_smoothing=smoothing,
+                )
 
-                # if bino_map:
-                #     all_binos = [v for vals in bino_map.values() for v in vals if not np.isnan(v)]
-                #     print(f"bino global: mean={np.mean(all_binos):.3f}, std={np.std(all_binos):.3f}")
+                lp_perf = float(-loss_p.item())
+                lp_obs = float(-loss_o.item())
 
+                logprobs_map.setdefault((str(did), int(pidx)), []).append(lp_perf)
+
+                bino = lp_perf / (lp_obs - 1e-8) if abs(lp_obs) > 1e-6 else float('nan')
                 bino_map.setdefault((str(did), int(pidx)), []).append(bino)
 
+            del enc, logits, shift_logits, shift_labels
             del enc_obs, logits_obs, shift_logits_obs, shift_labels_obs
             torch.cuda.empty_cache()
+
+        # for i in range(0, len(all_texts), BATCH_SIZE):
+        #     batch = all_texts[i:i + BATCH_SIZE]
+        #     texts_batch = [t for _, _, t in batch]
+        #
+        #     enc = tokenizer(
+        #         texts_batch,
+        #         return_tensors="pt",
+        #         padding=True,
+        #         truncation=True,
+        #         max_length=128,
+        #     ).to("cuda")
+        #
+        #     with torch.no_grad():
+        #         logits = model(**enc).logits  # (B, T, V)
+        #
+        #     shift_logits = logits[:, :-1, :].contiguous()   # (B, T-1, V)
+        #     shift_labels = enc["input_ids"][:, 1:].contiguous()   # (B, T-1)
+        #     pad_id = tokenizer.pad_token_id or 0
+        #
+        #     # ── ЕДИНЫЙ ЦИКЛ (перформер + наблюдатель синхронно) ──
+        #     for j, (did, pidx, _) in enumerate(batch):
+        #         lb_p = shift_labels[j]
+        #         lb_o = shift_labels_obs[j]
+        #         mask_p = lb_p != pad_id
+        #         mask_o = lb_o != pad_id_obs
+        #         common_mask = mask_p & mask_o  # только токены, которые видят оба
+        #
+        #         if common_mask.sum() == 0:
+        #             continue
+        #
+        #         n_toks = int(common_mask.sum())  # для label_smoothing (п.2)
+        #
+        #         loss_p = F.cross_entropy(
+        #             shift_logits[j][common_mask].float(),
+        #             lb_p[common_mask],
+        #             label_smoothing=0.1 if n_toks <= 8 else 0.0,  # сглаживание для коротких
+        #         )
+        #         loss_o = F.cross_entropy(
+        #             shift_logits_obs[j][common_mask].float(),
+        #             lb_o[common_mask],
+        #             label_smoothing=0.1 if n_toks <= 8 else 0.0,  # то же для наблюдателя
+        #         )
+        #
+        #         lp_perf = float(-loss_p.item())
+        #         lp_obs = float(-loss_o.item())
+        #
+        #         logprobs_map.setdefault((str(did), int(pidx)), []).append(lp_perf)
+        #
+        #         bino = lp_perf / (lp_obs - 1e-8) if abs(lp_obs) > 1e-6 else float('nan')
+        #         bino_map.setdefault((str(did), int(pidx)), []).append(bino)
+        #
+        #     # batch_lp больше не нужен — удалить его инициализацию batch_lp = {} выше
+        #     del enc, logits, shift_logits, shift_labels
+        #     del enc_obs, logits_obs, shift_logits_obs, shift_labels_obs
+        #     torch.cuda.empty_cache()
+        #
+        #     # batch_lp = {}
+        #     #
+        #     # for j, (did, pidx, _) in enumerate(batch):
+        #     #     lb = shift_labels[j]
+        #     #     mask = lb != pad_id
+        #     #     if mask.sum() == 0:
+        #     #         continue
+        #     #         # cross_entropy в fp16 — без конвертации в fp32
+        #     #     loss = F.cross_entropy(
+        #     #         shift_logits[j][mask].float(),  # только нужный срез, не весь тензор
+        #     #         lb[mask]
+        #     #     )
+        #     #
+        #     #     lp = float(-loss.item())
+        #     #     logprobs_map.setdefault((str(did), int(pidx)), []).append(lp)
+        #     #     batch_lp[j] = lp  # ← сохранять per-j
+        #     #     # logprobs_map.setdefault((did, pidx), []).append(float(-loss.item()))
+        #     #     # logprobs_map.setdefault((str(did), int(pidx)), []).append(float(-loss.item()))
+        #     #
+        #     # del enc, logits, shift_logits, shift_labels
+        #     # torch.cuda.empty_cache()  # ← освобождать после каждого батча
+        #     #
+        #     # # ── Observer batch (ruGPT-small) для Binoculars ──
+        #     # enc_obs = obs_tok(
+        #     #     texts_batch,
+        #     #     return_tensors="pt", padding=True,
+        #     #     truncation=True, max_length=128,
+        #     # ).to("cuda")
+        #     # with torch.no_grad():
+        #     #     logits_obs = obs_model(**enc_obs).logits
+        #     #
+        #     # shift_logits_obs = logits_obs[:, :-1, :].contiguous()
+        #     # shift_labels_obs = enc_obs["input_ids"][:, 1:].contiguous()
+        #     # pad_id_obs = obs_tok.pad_token_id or 0
+        #     #
+        #     # for j, (did, pidx, _) in enumerate(batch):
+        #     #     lb = shift_labels_obs[j]
+        #     #     mask = lb != pad_id_obs
+        #     #     if mask.sum() == 0:
+        #     #         continue
+        #     #     loss_obs = F.cross_entropy(
+        #     #         shift_logits_obs[j][mask].float(), lb[mask]
+        #     #     )
+        #     #     lp_list = logprobs_map.get((str(did), int(pidx)), [])
+        #     #     # lp_perf = lp_list[-1] if lp_list else None
+        #     #     # if lp_perf and lp_perf != 0:
+        #     #     #     bino = float(-loss_obs.item()) / abs(lp_perf)
+        #     #     # else:
+        #     #     #     bino = 1.0
+        #     #     lp_perf = batch_lp.get(j)  # ← точное значение для этой реплики
+        #     #     if lp_perf and lp_perf != 0:
+        #     #         bino = lp_perf / (-float(loss_obs.item()) - 1e-8)
+        #     #     #     bino = float(-loss_obs.item()) / abs
+        #     #     #
+        #     #     #     lp_obs = -float(loss_obs.item())  # logprob observer (отрицательный)
+        #     #     #     # добавлен clipping для стабильности (rugpt3small может давать очень низкий logprob)
+        #     #     #     bino = lp_perf / lp_obs  # оба отрицательны → ratio > 0, ~0.5–1.5
+        #     #     #     bino = np.clip(bino, 0.0, 3.0)
+        #     #     else:
+        #     #         bino = float('nan')
+        #     #
+        #     #     # if bino_map:
+        #     #     #     all_binos = [v for vals in bino_map.values() for v in vals if not np.isnan(v)]
+        #     #     #     print(f"bino global: mean={np.mean(all_binos):.3f}, std={np.std(all_binos):.3f}")
+        #     #
+        #     #     bino_map.setdefault((str(did), int(pidx)), []).append(bino)
+        #     #
+        #     # del enc_obs, logits_obs, shift_logits_obs, shift_labels_obs
+        #     # torch.cuda.empty_cache()
 
             if i % (BATCH_SIZE * 50) == 0:
                 print(f"  logprob batch {i // BATCH_SIZE}/{len(all_texts) // BATCH_SIZE}")
@@ -638,6 +759,14 @@ def train_and_predict():
     test_emb    = pd.read_parquet(f"{MOUNT_PATH}/test_emb_feats.parquet")
     train_lp    = pd.read_parquet(f"{MOUNT_PATH}/train_logprob.parquet")
     test_lp     = pd.read_parquet(f"{MOUNT_PATH}/test_logprob.parquet")
+
+    # Заменяем нулевой дефолт на медиану по train
+    bino_median = train_lp["bino_mean"].median()
+    logprob_median = train_lp["logprob_mean"].median()
+    train_lp["bino_mean"] = train_lp["bino_mean"].replace(0.0, bino_median)
+    test_lp["bino_mean"] = test_lp["bino_mean"].replace(0.0, bino_median)
+    train_lp["logprob_mean"] = train_lp["logprob_mean"].replace(0.0, logprob_median)
+    test_lp["logprob_mean"] = test_lp["logprob_mean"].replace(0.0, logprob_median)
 
     # приведение типов ключей везде
     for df in [ytrain, ytest, train_basic, test_basic,
@@ -729,6 +858,11 @@ def train_and_predict():
     meta_train["logprob_cv"] = meta_train["logprob_std"] / (meta_train["logprob_mean"].abs() + 1e-8)
     meta_test["logprob_cv"] = meta_test["logprob_std"] / (meta_test["logprob_mean"].abs() + 1e-8)
     # Coefficient of variation — нормализованная дисперсия
+
+    meta_train["bino_cv"] = meta_train["bino_std"] / (meta_train["bino_mean"].abs() + 1e-8)
+    meta_test["bino_cv"] = meta_test["bino_std"] / (meta_test["bino_mean"].abs() + 1e-8)
+    # bino_cv — коэффициент вариации bino по репликам:
+    # у бота реплики однородны → bino_cv низкий; у человека — разнородны
 
     # EXCLUDE = {"dialog_id", "participant_index", "is_bot", "ID"}
     # EXCLUDE = {"dialog_id", "participant_index", "is_bot", "ID", "ood_score"}
