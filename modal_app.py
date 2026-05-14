@@ -213,16 +213,16 @@ def build_basic_features():
                 feats["char_len_mean"] - opp_group["char_len"].mean()
                 if len(opp_group) else 0.0
             )
-            feats["char_len_std_diff"] = (
-                feats["char_len_std"] - opp_group["char_len"].std()
-                if len(opp_group) else 0.0
-            )
-            # Не взлетело - дало ухудшение на 0.013
             # feats["char_len_std_diff"] = (
-            #     feats["char_len_std"] - opp_group["char_len"].std(ddof=0)   # ddof=0 — смещенная дисперсия
-            #     # (population std), никогда не возвращает NaN даже для одного элемента (будет 0.0).
+            #     feats["char_len_std"] - opp_group["char_len"].std()
             #     if len(opp_group) else 0.0
             # )
+            # Не взлетело - дало ухудшение на 0.013
+            feats["char_len_std_diff"] = (
+                feats["char_len_std"] - opp_group["char_len"].std(ddof=0)   # ddof=0 — смещенная дисперсия
+            #     # (population std), никогда не возвращает NaN даже для одного элемента (будет 0.0).
+            #     if len(opp_group) else 0.0
+            )
 
             if len(opp_group) >= 2:
                 opp_lengths = opp_group["char_len"].values
@@ -377,7 +377,7 @@ def build_perplexity_features():
     """
     import json, pandas as pd, numpy as np
     import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
     MODEL_NAME = "Qwen/Qwen2-7B"
     # MODEL_NAME = "IlyaGusev/saiga_llama3_8b"
@@ -397,9 +397,12 @@ def build_perplexity_features():
     #     MODEL_NAME,
     #     dtype=torch.float16,
     # ).to("cuda")
+
+    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        load_in_8bit=True,  # ~7.5 GB вместо 14 GB
+        quantization_config=bnb_config,
         device_map="auto",
     )
 
@@ -547,132 +550,6 @@ def build_perplexity_features():
 
             del shift_logits_p, shift_labels_p, shift_logits_o, shift_labels_o
 
-        # for i in range(0, len(all_texts), BATCH_SIZE):
-        #     batch = all_texts[i:i + BATCH_SIZE]
-        #     texts_batch = [t for _, _, t in batch]
-        #
-        #     enc = tokenizer(
-        #         texts_batch,
-        #         return_tensors="pt",
-        #         padding=True,
-        #         truncation=True,
-        #         max_length=128,
-        #     ).to("cuda")
-        #
-        #     with torch.no_grad():
-        #         logits = model(**enc).logits  # (B, T, V)
-        #
-        #     shift_logits = logits[:, :-1, :].contiguous()   # (B, T-1, V)
-        #     shift_labels = enc["input_ids"][:, 1:].contiguous()   # (B, T-1)
-        #     pad_id = tokenizer.pad_token_id or 0
-        #
-        #     # ── ЕДИНЫЙ ЦИКЛ (перформер + наблюдатель синхронно) ──
-        #     for j, (did, pidx, _) in enumerate(batch):
-        #         lb_p = shift_labels[j]
-        #         lb_o = shift_labels_obs[j]
-        #         mask_p = lb_p != pad_id
-        #         mask_o = lb_o != pad_id_obs
-        #         common_mask = mask_p & mask_o  # только токены, которые видят оба
-        #
-        #         if common_mask.sum() == 0:
-        #             continue
-        #
-        #         n_toks = int(common_mask.sum())  # для label_smoothing (п.2)
-        #
-        #         loss_p = F.cross_entropy(
-        #             shift_logits[j][common_mask].float(),
-        #             lb_p[common_mask],
-        #             label_smoothing=0.1 if n_toks <= 8 else 0.0,  # сглаживание для коротких
-        #         )
-        #         loss_o = F.cross_entropy(
-        #             shift_logits_obs[j][common_mask].float(),
-        #             lb_o[common_mask],
-        #             label_smoothing=0.1 if n_toks <= 8 else 0.0,  # то же для наблюдателя
-        #         )
-        #
-        #         lp_perf = float(-loss_p.item())
-        #         lp_obs = float(-loss_o.item())
-        #
-        #         logprobs_map.setdefault((str(did), int(pidx)), []).append(lp_perf)
-        #
-        #         bino = lp_perf / (lp_obs - 1e-8) if abs(lp_obs) > 1e-6 else float('nan')
-        #         bino_map.setdefault((str(did), int(pidx)), []).append(bino)
-        #
-        #     # batch_lp больше не нужен — удалить его инициализацию batch_lp = {} выше
-        #     del enc, logits, shift_logits, shift_labels
-        #     del enc_obs, logits_obs, shift_logits_obs, shift_labels_obs
-        #     torch.cuda.empty_cache()
-        #
-        #     # batch_lp = {}
-        #     #
-        #     # for j, (did, pidx, _) in enumerate(batch):
-        #     #     lb = shift_labels[j]
-        #     #     mask = lb != pad_id
-        #     #     if mask.sum() == 0:
-        #     #         continue
-        #     #         # cross_entropy в fp16 — без конвертации в fp32
-        #     #     loss = F.cross_entropy(
-        #     #         shift_logits[j][mask].float(),  # только нужный срез, не весь тензор
-        #     #         lb[mask]
-        #     #     )
-        #     #
-        #     #     lp = float(-loss.item())
-        #     #     logprobs_map.setdefault((str(did), int(pidx)), []).append(lp)
-        #     #     batch_lp[j] = lp  # ← сохранять per-j
-        #     #     # logprobs_map.setdefault((did, pidx), []).append(float(-loss.item()))
-        #     #     # logprobs_map.setdefault((str(did), int(pidx)), []).append(float(-loss.item()))
-        #     #
-        #     # del enc, logits, shift_logits, shift_labels
-        #     # torch.cuda.empty_cache()  # ← освобождать после каждого батча
-        #     #
-        #     # # ── Observer batch (ruGPT-small) для Binoculars ──
-        #     # enc_obs = obs_tok(
-        #     #     texts_batch,
-        #     #     return_tensors="pt", padding=True,
-        #     #     truncation=True, max_length=128,
-        #     # ).to("cuda")
-        #     # with torch.no_grad():
-        #     #     logits_obs = obs_model(**enc_obs).logits
-        #     #
-        #     # shift_logits_obs = logits_obs[:, :-1, :].contiguous()
-        #     # shift_labels_obs = enc_obs["input_ids"][:, 1:].contiguous()
-        #     # pad_id_obs = obs_tok.pad_token_id or 0
-        #     #
-        #     # for j, (did, pidx, _) in enumerate(batch):
-        #     #     lb = shift_labels_obs[j]
-        #     #     mask = lb != pad_id_obs
-        #     #     if mask.sum() == 0:
-        #     #         continue
-        #     #     loss_obs = F.cross_entropy(
-        #     #         shift_logits_obs[j][mask].float(), lb[mask]
-        #     #     )
-        #     #     lp_list = logprobs_map.get((str(did), int(pidx)), [])
-        #     #     # lp_perf = lp_list[-1] if lp_list else None
-        #     #     # if lp_perf and lp_perf != 0:
-        #     #     #     bino = float(-loss_obs.item()) / abs(lp_perf)
-        #     #     # else:
-        #     #     #     bino = 1.0
-        #     #     lp_perf = batch_lp.get(j)  # ← точное значение для этой реплики
-        #     #     if lp_perf and lp_perf != 0:
-        #     #         bino = lp_perf / (-float(loss_obs.item()) - 1e-8)
-        #     #     #     bino = float(-loss_obs.item()) / abs
-        #     #     #
-        #     #     #     lp_obs = -float(loss_obs.item())  # logprob observer (отрицательный)
-        #     #     #     # добавлен clipping для стабильности (rugpt3small может давать очень низкий logprob)
-        #     #     #     bino = lp_perf / lp_obs  # оба отрицательны → ratio > 0, ~0.5–1.5
-        #     #     #     bino = np.clip(bino, 0.0, 3.0)
-        #     #     else:
-        #     #         bino = float('nan')
-        #     #
-        #     #     # if bino_map:
-        #     #     #     all_binos = [v for vals in bino_map.values() for v in vals if not np.isnan(v)]
-        #     #     #     print(f"bino global: mean={np.mean(all_binos):.3f}, std={np.std(all_binos):.3f}")
-        #     #
-        #     #     bino_map.setdefault((str(did), int(pidx)), []).append(bino)
-        #     #
-        #     # del enc_obs, logits_obs, shift_logits_obs, shift_labels_obs
-        #     # torch.cuda.empty_cache()
-
             if i % (BATCH_SIZE * 50) == 0:
                 print(f"  logprob batch {i // BATCH_SIZE}/{len(all_texts) // BATCH_SIZE}")
 
@@ -695,12 +572,15 @@ def build_perplexity_features():
                 "logprob_mean": np.mean(lp_clean) if lp_clean else 0.0,
                 "logprob_std": np.std(lp_clean) if len(lp_clean) > 1 else 0.0,
                 "logprob_min": np.min(lp_clean) if lp_clean else 0.0,
+                "logprob_max": float(np.max(lp_clean)) if lp_clean else 0.0,
                 # "bino_mean": np.mean(bino_vals) if bino_vals else 1.0,  # ← ДОБАВИТЬ
                 # "bino_std": np.std(bino_vals) if len(bino_vals) > 1 else 0.0,  # ← ДОБАВИТЬ
                 "bino_mean": float(np.nanmean(bino_vals)) if bino_vals else 0.0,            # лучший результат
                 "bino_std": float(np.nanstd(bino_vals)) if len(bino_vals) > 1 else 0.0,
                 # "bino_mean": float(np.mean(bino_clean)) if bino_clean else 0.0,           # не взлетело
                 # "bino_std": float(np.std(bino_clean)) if len(bino_clean) > 1 else 0.0,
+                "bino_max": float(np.nanmax(bino_vals)) if bino_vals else 0.0,
+                "bino_min": float(np.nanmin(bino_vals)) if bino_vals else 0.0,
             })
         return pd.DataFrame(rows)
 
@@ -866,15 +746,29 @@ def train_and_predict():
     # bino_cv — коэффициент вариации bino по репликам:
     # у бота реплики однородны → bino_cv низкий; у человека — разнородны
 
-    # EXCLUDE = {"dialog_id", "participant_index", "is_bot", "ID"}
-    # EXCLUDE = {"dialog_id", "participant_index", "is_bot", "ID", "ood_score"}
     EXCLUDE = {
         "dialog_id", "participant_index", "is_bot", "ID", "ood_score",
         # cyrillic_ratio — корреляция 0.045, только шум
         "cyrillic_ratio_mean", "cyrillic_ratio_std", "cyrillic_ratio_median",
         "cyrillic_ratio_skew", "cyrillic_ratio_min", "cyrillic_ratio_max",
         "cyrillic_ratio_is_constant",
+        "char_len_is_constant", "upper_ratio_is_constant", "word_count_is_constant",
+        "digit_ratio_median", "digit_ratio_mean", "unique_char_r_is_constant",
+        "has_newline_skew", "trigram_diversity", "ends_with_q_max", "ends_with_q_min",
+        "digit_ratio_min", "digit_ratio_is_constant"
     }
+    # оставляем "ood_score"
+    # EXCLUDE = {
+    #     "dialog_id", "participant_index", "is_bot", "ID",
+    #     # cyrillic_ratio — корреляция 0.045, только шум
+    #     "cyrillic_ratio_mean", "cyrillic_ratio_std", "cyrillic_ratio_median",
+    #     "cyrillic_ratio_skew", "cyrillic_ratio_min", "cyrillic_ratio_max",
+    #     "cyrillic_ratio_is_constant",
+    #     "char_len_is_constant", "upper_ratio_is_constant", "word_count_is_constant",
+    #     "digit_ratio_median", "digit_ratio_mean", "unique_char_r_is_constant",
+    #     "has_newline_skew", "trigram_diversity", "ends_with_q_max", "ends_with_q_min",
+    #     "digit_ratio_min", "digit_ratio_is_constant"
+    # }
     FEAT_COLS = [c for c in meta_train.columns if c not in EXCLUDE]
 
     # Диагностика
@@ -1048,6 +942,19 @@ def train_and_predict():
         eval_metric="binary_logloss",
         callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(200)]
     )
+
+    from sklearn.isotonic import IsotonicRegression
+    from sklearn.model_selection import cross_val_predict
+
+    oof_cal = cross_val_predict(
+        lgb_model_final, X_tr, y_tr,
+        cv=skf, method="predict_proba"
+    )[:, 1]
+
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(oof_cal, y_tr)
+
+
     print(f"Best iteration: {lgb_model_final.best_iteration_}")
 
     # ===============================================
@@ -1067,9 +974,13 @@ def train_and_predict():
     print(zero_feats["feature"].tolist())
     # ===============================================
 
-    # test_probs = lgb_model.predict_proba(X_te)[:, 1]
-    test_probs = lgb_model_final.predict_proba(X_te)[:, 1]
-    test_probs = np.clip(test_probs, 0.001, 0.999)
+    # # test_probs = lgb_model.predict_proba(X_te)[:, 1]
+    # test_probs = lgb_model_final.predict_proba(X_te)[:, 1]
+    # test_probs = np.clip(test_probs, 0.001, 0.999)
+
+    raw_probs = lgb_model_final.predict_proba(X_te)[:, 1]
+    test_probs = iso.predict(raw_probs)
+    test_probs = np.clip(test_probs, 0.001, 0.999)  # оставить — isotonic может дать 0.0/1.0
 
     # Формирование сабмиссии в нужном формате
     submission = ytest[["ID"]].copy()
