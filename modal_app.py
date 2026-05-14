@@ -12,6 +12,7 @@ image = (
         "accelerate", "tqdm",
         "scipy", "joblib",
         "pyarrow",
+        "bitsandbytes",
     ])
 )
 
@@ -392,10 +393,16 @@ def build_perplexity_features():
     #     tokenizer.pad_token = tokenizer.eos_token   # проверка для Mistral,
     #     # для Qwen pad_token уже установлен (<|endoftext|>)
 
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     MODEL_NAME,
+    #     dtype=torch.float16,
+    # ).to("cuda")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        dtype=torch.float16,
-    ).to("cuda")
+        load_in_8bit=True,  # ~7.5 GB вместо 14 GB
+        device_map="auto",
+    )
+
     model.eval()
 
     # Sanity check
@@ -476,42 +483,40 @@ def build_perplexity_features():
             batch = all_texts[i:i + BATCH_SIZE]
             texts_batch = [t for _, _, t in batch]
 
-            # ── Перформер ──
+            # ── Проход 1: перформер → сохраняем logits на CPU ──
             enc = tokenizer(
-                texts_batch,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=128,
+                texts_batch, return_tensors="pt",
+                padding=True, truncation=True, max_length=128,
             ).to("cuda")
-
-            with torch.no_grad():
-                logits = model(**enc).logits
-
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = enc["input_ids"][:, 1:].contiguous()
             pad_id = tokenizer.pad_token_id or 0
 
-            # ── Наблюдатель (добавить здесь, ДО единого цикла) ──
-            enc_obs = obs_tok(
-                texts_batch,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=128,
-            ).to("cuda")
-
             with torch.no_grad():
-                logits_obs = obs_model(**enc_obs).logits
+                logits_p = model(**enc).logits  # (B, T, V) на GPU
 
-            shift_logits_obs = logits_obs[:, :-1, :].contiguous()
-            shift_labels_obs = enc_obs["input_ids"][:, 1:].contiguous()
+            shift_logits_p = logits_p[:, :-1, :].cpu()  # ← сразу на CPU
+            shift_labels_p = enc["input_ids"][:, 1:].cpu()
+            del enc, logits_p
+            torch.cuda.empty_cache()  # ← освобождаем GPU до наблюдателя
+
+            # ── Проход 2: наблюдатель ──
+            enc_obs = obs_tok(
+                texts_batch, return_tensors="pt",
+                padding=True, truncation=True, max_length=128,
+            ).to("cuda")
             pad_id_obs = obs_tok.pad_token_id or 0
 
-            # ── Единый цикл по репликам ──
+            with torch.no_grad():
+                logits_o = obs_model(**enc_obs).logits
+
+            shift_logits_o = logits_o[:, :-1, :].cpu()  # ← тоже на CPU
+            shift_labels_o = enc_obs["input_ids"][:, 1:].cpu()
+            del enc_obs, logits_o
+            torch.cuda.empty_cache()
+
+            # ── Единый цикл по репликам (всё на CPU) ──
             for j, (did, pidx, _) in enumerate(batch):
-                lb_p = shift_labels[j]
-                lb_o = shift_labels_obs[j]
+                lb_p = shift_labels_p[j]
+                lb_o = shift_labels_o[j]
                 mask_p = lb_p != pad_id
                 mask_o = lb_o != pad_id_obs
                 common_mask = mask_p & mask_o
@@ -523,12 +528,12 @@ def build_perplexity_features():
                 smoothing = max(0.0, 0.1 * (1 - n_toks / 8)) if n_toks < 8 else 0.0
 
                 loss_p = F.cross_entropy(
-                    shift_logits[j][common_mask].float(),
+                    shift_logits_p[j][common_mask].float(),
                     lb_p[common_mask],
                     label_smoothing=smoothing,
                 )
                 loss_o = F.cross_entropy(
-                    shift_logits_obs[j][common_mask].float(),
+                    shift_logits_o[j][common_mask].float(),
                     lb_o[common_mask],
                     label_smoothing=smoothing,
                 )
@@ -537,13 +542,10 @@ def build_perplexity_features():
                 lp_obs = float(-loss_o.item())
 
                 logprobs_map.setdefault((str(did), int(pidx)), []).append(lp_perf)
-
                 bino = lp_perf / (lp_obs - 1e-8) if abs(lp_obs) > 1e-6 else float('nan')
                 bino_map.setdefault((str(did), int(pidx)), []).append(bino)
 
-            del enc, logits, shift_logits, shift_labels
-            del enc_obs, logits_obs, shift_logits_obs, shift_labels_obs
-            torch.cuda.empty_cache()
+            del shift_logits_p, shift_labels_p, shift_logits_o, shift_labels_o
 
         # for i in range(0, len(all_texts), BATCH_SIZE):
         #     batch = all_texts[i:i + BATCH_SIZE]
