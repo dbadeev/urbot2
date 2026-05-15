@@ -321,31 +321,30 @@ def build_embedding_features():
     train_keys, train_embs, train_drifts = get_features(train_dialogs, ytrain)
     test_keys,  test_embs,  test_drifts  = get_features(test_dialogs,  ytest)
 
-    # OOD-score: Mahalanobis distance от центра "человеческих" эмбеддингов
-    # (Архитектура 2 как признак внутри Архитектуры 1)
-    human_mask = [
-        ytrain.loc[
-            (ytrain["dialog_id"] == k[0]) &
-            (ytrain["participant_index"] == k[1]), "is_bot"
-        ].values[0] == 0
-        for k in train_keys
-    ]
-    human_embs = train_embs[human_mask]
-
-    cov = EmpiricalCovariance().fit(human_embs)
-    train_ood = cov.mahalanobis(train_embs)
-    test_ood  = cov.mahalanobis(test_embs)
+    # !!!!!!!!!!!! НЕ ИСПОЛЬЗУЕТСЯ !!!!!!!!!!!!!
+    # # OOD-score: Mahalanobis distance от центра "человеческих" эмбеддингов
+    # # (Архитектура 2 как признак внутри Архитектуры 1)
+    # human_mask = [
+    #     ytrain.loc[
+    #         (ytrain["dialog_id"] == k[0]) &
+    #         (ytrain["participant_index"] == k[1]), "is_bot"
+    #     ].values[0] == 0
+    #     for k in train_keys
+    # ]
+    # human_embs = train_embs[human_mask]
+    #
+    # cov = EmpiricalCovariance().fit(human_embs)
+    # train_ood = cov.mahalanobis(train_embs)
+    # test_ood  = cov.mahalanobis(test_embs)
 
     # Сохраняем всё
     train_emb_df = pd.DataFrame(
-        [{"dialog_id": k[0], "participant_index": k[1],
-          "context_drift": d, "ood_score": s}
-         for k, d, s in zip(train_keys, train_drifts, train_ood)]
+        [{"dialog_id": k[0], "participant_index": k[1], "context_drift": d}
+         for k, d in zip(train_keys, train_drifts)]
     )
     test_emb_df = pd.DataFrame(
-        [{"dialog_id": k[0], "participant_index": k[1],
-          "context_drift": d, "ood_score": s}
-         for k, d, s in zip(test_keys, test_drifts, test_ood)]
+        [{"dialog_id": k[0], "participant_index": k[1], "context_drift": d}
+         for k, d in zip(test_keys, test_drifts)]
     )
     np.save(f"{MOUNT_PATH}/train_embeddings.npy", train_embs)
     np.save(f"{MOUNT_PATH}/test_embeddings.npy",  test_embs)
@@ -798,29 +797,26 @@ def train_and_predict():
     print(shift_df[shift_df["shift_sigma"] > 0.3].to_string())  # только подозрительные
 
     # ─── Шаг 2а: предварительная модель для отбора признаков ───
-    lgb_pre = lgb.LGBMClassifier(
-        n_estimators=500, learning_rate=0.05,
-        num_leaves=31, random_state=42,
-        colsample_bytree=0.7, subsample=0.8,
-    )
-    lgb_pre.fit(meta_train[FEAT_COLS].fillna(0), y_train)
-
-    importance_df = pd.DataFrame({
-        "feature": FEAT_COLS,
-        "importance": lgb_pre.feature_importances_
-    }).sort_values("importance", ascending=False)
-
-    print("\nFeature importances (top-20):")
-    print(importance_df.head(20).to_string())
-
-    zero_feats = set(importance_df[importance_df["importance"] == 0]["feature"].tolist())
-    print(f"\nRemoving zero-importance: {len(zero_feats)} features: {zero_feats}")
-
-    FEAT_COLS = [c for c in FEAT_COLS if c not in zero_feats]  # ← перезаписываем FEAT_COLS
-    print(f"Features after filtering: {len(FEAT_COLS)}")
-
-    train_embs_raw = np.load(f"{MOUNT_PATH}/train_embeddings.npy")  # (3032, 768)  → (3032, 1024)
-    test_embs_raw = np.load(f"{MOUNT_PATH}/test_embeddings.npy")  # (758, 768)  → (758, 1024)
+    # lgb_pre = lgb.LGBMClassifier(
+    #     n_estimators=500, learning_rate=0.05,
+    #     num_leaves=31, random_state=42,
+    #     colsample_bytree=0.7, subsample=0.8,
+    # )
+    # lgb_pre.fit(meta_train[FEAT_COLS].fillna(0), y_train)
+    #
+    # importance_df = pd.DataFrame({
+    #     "feature": FEAT_COLS,
+    #     "importance": lgb_pre.feature_importances_
+    # }).sort_values("importance", ascending=False)
+    #
+    # print("\nFeature importances (top-20):")
+    # print(importance_df.head(20).to_string())
+    #
+    # zero_feats = set(importance_df[importance_df["importance"] == 0]["feature"].tolist())
+    # print(f"\nRemoving zero-importance: {len(zero_feats)} features: {zero_feats}")
+    #
+    # FEAT_COLS = [c for c in FEAT_COLS if c not in zero_feats]  # ← перезаписываем FEAT_COLS
+    # print(f"Features after filtering: {len(FEAT_COLS)}")
 
     def add_cross_sim(labels_df, embs_raw):
         """Косинусное сходство эмбеддингов p0 и p1 одного диалога."""
@@ -843,13 +839,41 @@ def train_and_predict():
             sims.append(s)
         return sims
 
+    train_embs_raw = np.load(f"{MOUNT_PATH}/train_embeddings.npy")  # (3032, 768)  → (3032, 1024)
+    test_embs_raw = np.load(f"{MOUNT_PATH}/test_embeddings.npy")  # (758, 768)  → (758, 1024)
+
+    # СНАЧАЛА добавляем cross_sim
     meta_train["cross_sim"] = add_cross_sim(meta_train, train_embs_raw)
     meta_test["cross_sim"] = add_cross_sim(meta_test, test_embs_raw)
 
+    # Переопределить FEAT_COLS один раз — включая cross_sim.
     # Добавить "cross_sim" в FEAT_COLS — он не попадёт в EXCLUDE,
     # поэтому подхватится автоматически при переопределении FEAT_COLS:
     FEAT_COLS = [c for c in meta_train.columns if c not in EXCLUDE]
     # ↑ ВАЖНО: эту строку перенести ПОСЛЕ добавления cross_sim в meta_train
+    print("FEAT_COLS:", FEAT_COLS)
+
+    # ─── ТЕПЕРЬ lgb_pre видит cross_sim───
+    lgb_pre = lgb.LGBMClassifier(
+        n_estimators=500, learning_rate=0.05,
+        num_leaves=31, random_state=42,
+        colsample_bytree=0.7, subsample=0.8,
+    )
+    lgb_pre.fit(meta_train[FEAT_COLS].fillna(0), y_train)
+
+    importance_df = pd.DataFrame({
+        "feature": FEAT_COLS,
+        "importance": lgb_pre.feature_importances_
+    }).sort_values("importance", ascending=False)
+
+    print("\nFeature importances (top-20):")
+    print(importance_df.head(20).to_string())
+
+    zero_feats = set(importance_df[importance_df["importance"] == 0]["feature"].tolist())
+    print(f"\nRemoving zero-importance: {len(zero_feats)} features: {zero_feats}")
+
+    FEAT_COLS = [c for c in FEAT_COLS if c not in zero_feats]  # ← перезаписываем FEAT_COLS
+    print(f"Features after filtering: {len(FEAT_COLS)}")
 
 
     medians = meta_train[FEAT_COLS].median()
@@ -871,89 +895,41 @@ def train_and_predict():
     print(f"NaN after fillna: {np.isnan(X_tr).sum()}")  # должно быть 0
 
     # LightGBM с ранней остановкой
-    # lgb_model = lgb.LGBMClassifier(
-    #     n_estimators=1000,
-    #     learning_rate=0.03,
-    #     num_leaves=31, # было 63
-    #     verbosity=-1,
-    #     subsample=0.8,
-    #     colsample_bytree=0.7,
-    #     min_child_samples=10, # было 20
-    #     reg_alpha=0.1,
-    #     reg_lambda=0.1,
-    #     random_state=42,
-    #     # class_weight="balanced",
-    #     # is_unbalance=True,
-    # )
-    #
-    # # OOF для оценки LogLoss
-    # oof_preds = cross_val_predict(lgb_model, X_tr, y_tr,
-    #                               cv=skf, method="predict_proba")[:, 1]
-    # print(f"OOF LogLoss: {log_loss(y_tr, oof_preds):.4f}")
-    #
-    # # Калибровка вероятностей (КРИТИЧНО для LogLoss!)
-    # # CalibratedClassifierCV с method='isotonic' для нелинейной коррекции
-    # # calibrated = CalibratedClassifierCV(lgb_model, method="isotonic", cv=5)
-    #
-    # # calibrated = CalibratedClassifierCV(lgb_model, method="sigmoid", cv=5)
-    # # calibrated.fit(X_tr, y_tr)
-    # #
-    # # test_probs = calibrated.predict_proba(X_te)[:, 1]
-    # # test_probs = np.clip(test_probs, 0.001, 0.999)
-    #
-    # lgb_model.fit(X_tr, y_tr)
-
-    lgb_model = lgb.LGBMClassifier(
+    lgb_base = lgb.LGBMClassifier(
         n_estimators=1000,
         learning_rate=0.03,
-        num_leaves=31,
+        num_leaves=31, # было 63
         verbosity=-1,
         subsample=0.8,
         colsample_bytree=0.7,
-        min_child_samples=10,
+        min_child_samples=10, # было 20
         reg_alpha=0.1,
         reg_lambda=0.1,
         random_state=42,
+        # class_weight="balanced",
+        # is_unbalance=True,
     )
 
-    # OOF оценка (без early stopping — для честного сравнения)
-    oof_preds = cross_val_predict(lgb_model, X_tr, y_tr,
+    # CalibratedClassifierCV делает cv=5 внутри:
+    # в каждом фолде обучает lgb_base на 4/5 данных,
+    # предсказывает на 1/5, обучает sigmoid-Platt на held-out части,
+    # финальная модель = среднее 5 калиброванных моделей
+    calibrated = CalibratedClassifierCV(lgb_base, method="sigmoid", cv=5)
+    calibrated.fit(X_tr, y_tr)
+    #
+    # # OOF для оценки LogLoss
+    oof_preds = cross_val_predict(lgb_base, X_tr, y_tr,
                                   cv=skf, method="predict_proba")[:, 1]
-    print(f"OOF LogLoss: {log_loss(y_tr, oof_preds):.4f}")
+    print(f"OOF LogLoss (uncalibrated): {log_loss(y_tr, oof_preds):.4f}")
 
-    # Platt scaling — логистическая регрессия поверх OOF скоров
-    platt = PlattLR(C=1.0, max_iter=1000)
-    platt.fit(oof_preds.reshape(-1, 1), y_tr)
-
-    # Финальное обучение с early stopping на hold-out 10%
-    X_fit, X_val, y_fit, y_val = train_test_split(
-        X_tr, y_tr, test_size=0.1, stratify=y_tr, random_state=42
-    )
-    lgb_model_final = lgb.LGBMClassifier(
-        n_estimators=3000,
-        learning_rate=0.02,
-        num_leaves=31,
-        verbosity=-1,
-        subsample=0.8,
-        colsample_bytree=0.7,
-        min_child_samples=10,
-        reg_alpha=0.1,
-        reg_lambda=0.1,
-        random_state=42,
-    )
-    lgb_model_final.fit(
-        X_fit, y_fit,
-        eval_set=[(X_val, y_val)],
-        eval_metric="binary_logloss",
-        callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(200)]
-    )
-
-    print(f"Best iteration: {lgb_model_final.best_iteration_}")
+    test_probs = calibrated.predict_proba(X_te)[:, 1]
+    test_probs = np.clip(test_probs, 0.001, 0.999)
 
     # ===============================================
-    # INFO: Важность признаков
+    # INFO: Важность признаков из одного из 5 estimators внутри CalibratedClassifierCV
+    base_estimator = calibrated.calibrated_classifiers_[0].estimator
     feat_names = list(FEAT_COLS) + [f"pca_{i}" for i in range(train_embs_pca.shape[1])]
-    importances = lgb_model_final.feature_importances_
+    importances = base_estimator.feature_importances_
     importance_df = pd.DataFrame({
         "feature": feat_names,
         "importance": importances
@@ -967,22 +943,12 @@ def train_and_predict():
     print(zero_feats["feature"].tolist())
     # ===============================================
 
-    # # test_probs = lgb_model.predict_proba(X_te)[:, 1]
-    # test_probs = lgb_model_final.predict_proba(X_te)[:, 1]
-    # test_probs = np.clip(test_probs, 0.001, 0.999)
-
-    # raw_probs = lgb_model_final.predict_proba(X_te)[:, 1]
-    # test_probs = iso.predict(raw_probs)
-    # test_probs = np.clip(test_probs, 0.001, 0.999)  # оставить — isotonic может дать 0.0/1.0
-
-    raw_probs = lgb_model_final.predict_proba(X_te)[:, 1]
-    test_probs = platt.predict_proba(raw_probs.reshape(-1, 1))[:, 1]
-    test_probs = np.clip(test_probs, 0.001, 0.999)
-
     # Формирование сабмиссии в нужном формате
     submission = ytest[["ID"]].copy()
     submission["is_bot"] = test_probs
-    submission.to_csv(f"{MOUNT_PATH}/submission_2.csv", index=False)
+    # submission.to_csv(f"{MOUNT_PATH}/submission_2.csv", index=False)
+    SUBMISSION_NAME = "submission_latest.csv"
+    submission.to_csv(f"{MOUNT_PATH}/{SUBMISSION_NAME}", index=False)
     volume.commit()
     print(f"Submission saved: {len(submission)} rows")
     print(submission.head())
@@ -1013,9 +979,14 @@ def main():
     train_and_predict.remote()
 
     volume_obj = modal.Volume.from_name("urbot-data")
-    with open("submission_3.csv", "wb") as f:
-        for chunk in volume_obj.read_file("submission_3.csv"):
+    # with open("submission_3.csv", "wb") as f:
+    #     for chunk in volume_obj.read_file("submission_3.csv"):
+    #         f.write(chunk)
+    SUBMISSION_NAME = "submission_latest.csv"
+    local_name = "submission_new.csv"
+    with open(local_name, "wb") as f:
+        for chunk in volume_obj.read_file(SUBMISSION_NAME):
             f.write(chunk)
-    print("Downloaded: submission_2.csv")
+    print(f"Downloaded: {local_name}")
 
     print("Pipeline complete! Submission at /data/submission_2.csv")
